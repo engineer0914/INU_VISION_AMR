@@ -1,0 +1,17 @@
+path: /home/hdladmin/RoboCup/SynthData20000_YOLO_7_2_1
+train: images/train
+val: images/val
+test: images/test
+nc: 11
+names:
+  0: Battery
+  1: Magnet
+  2: EStop
+  3: Carrot
+  4: TrafficLight
+  5: SmallTree
+  6: Hammer
+  7: BigCarrot
+  8: Burger
+  9: IceCream
+  10: BigTree
