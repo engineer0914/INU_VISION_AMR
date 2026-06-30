@@ -70,6 +70,19 @@ HUE_COLOR_PARAMS = {
 }
 HSV_COLOR_RANGES = HUE_COLOR_PARAMS  # endpoint score 루프 호환용 alias
 
+# Brick 서비스(ID 1~8)에서만 사용하는 조립체 선검출 기반 비활성화 설정.
+# component YOLO segmentation 내부에서 red/yellow/green/blue 중
+# 충분히 넓은 색 영역이 2개 이상 나오면 "다색 조립체"로 보고 해당 영역을
+# brick YOLO 입력 이미지에서 검은색으로 비활성화한다.
+COMPONENT_COLOR_BLOCK_COLORS = ("red", "yellow", "green", "blue")
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLORS = 2
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLOR_RATIO = 0.10
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_RATIO = 0.04
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_AREA_PX = 40
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_MASK_AREA_PX = 120
+DEFAULT_COMPONENT_BLOCK_OVERLAP_RATIO = 0.20
+DEFAULT_COMPONENT_DISABLE_DILATE_PX = 2
+
 
 @dataclass
 class PoseResult:
@@ -104,6 +117,14 @@ class Vision6DPoseManager:
         use_depth_median_filter=True,
         depth_median_margin_m=0.030,
         depth_median_min_samples=2,
+        use_component_color_block_filter=True,
+        component_color_block_min_colors=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLORS,
+        component_color_block_min_color_ratio=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLOR_RATIO,
+        component_color_block_min_region_ratio=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_RATIO,
+        component_color_block_min_region_area_px=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_AREA_PX,
+        component_color_block_min_mask_area_px=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_MASK_AREA_PX,
+        component_block_overlap_ratio=DEFAULT_COMPONENT_BLOCK_OVERLAP_RATIO,
+        component_disable_dilate_px=DEFAULT_COMPONENT_DISABLE_DILATE_PX,
     ):
         self.logger = logger
         self.det_model_path = det_model_path
@@ -122,6 +143,14 @@ class Vision6DPoseManager:
         self.use_depth_median_filter = bool(use_depth_median_filter)
         self.depth_median_margin_m = float(depth_median_margin_m)
         self.depth_median_min_samples = int(depth_median_min_samples)
+        self.use_component_color_block_filter = bool(use_component_color_block_filter)
+        self.component_color_block_min_colors = int(component_color_block_min_colors)
+        self.component_color_block_min_color_ratio = float(component_color_block_min_color_ratio)
+        self.component_color_block_min_region_ratio = float(component_color_block_min_region_ratio)
+        self.component_color_block_min_region_area_px = int(component_color_block_min_region_area_px)
+        self.component_color_block_min_mask_area_px = int(component_color_block_min_mask_area_px)
+        self.component_block_overlap_ratio = float(component_block_overlap_ratio)
+        self.component_disable_dilate_px = int(component_disable_dilate_px)
         self.stop_requested = False
         self._pipeline_started = False
 
@@ -164,7 +193,12 @@ class Vision6DPoseManager:
             f"visualize={self.visualize}, visualize_scale={self.visualize_scale}, shape_filter={self.use_shape_ratio_filter}, "
             f"shape_ratio_threshold={self.shape_ratio_threshold}, edge_contact_max_px={self.edge_contact_max_px}, "
             f"edge_contact_margin_px={self.edge_contact_margin_px}, depth_median_filter={self.use_depth_median_filter}, "
-            f"depth_median_margin_m={self.depth_median_margin_m}, depth_median_min_samples={self.depth_median_min_samples}"
+            f"depth_median_margin_m={self.depth_median_margin_m}, depth_median_min_samples={self.depth_median_min_samples}, "
+            f"component_color_block_filter={self.use_component_color_block_filter}, "
+            f"component_color_block_min_colors={self.component_color_block_min_colors}, "
+            f"component_color_block_min_color_ratio={self.component_color_block_min_color_ratio}, "
+            f"component_color_block_min_region_ratio={self.component_color_block_min_region_ratio}, "
+            f"component_block_overlap_ratio={self.component_block_overlap_ratio}"
         )
 
     def shutdown(self):
@@ -266,12 +300,49 @@ class Vision6DPoseManager:
             return False, None
 
         image = np.asanyarray(color_frame.get_data())
-        det_result, seg_result = self._infer_for_mode("brick_target", image)
+
+        # ------------------------------------------------------------
+        # [NEW] Brick 서비스 전용 Step 0
+        # component YOLO를 먼저 실행해서 13/34/... 조립체 후보 segmentation을 얻는다.
+        # segmentation 내부 HSV H 분포에서 red/yellow/green/blue 중 넓은 색 영역이
+        # 2개 이상이면 다색 조립체로 보고 그 mask만 brick YOLO 입력에서 비활성화한다.
+        # 단색으로 보이는 영역은 단일 브릭일 가능성이 있으므로 남긴다.
+        # ------------------------------------------------------------
+        component_block_payload = self.build_component_color_disable_mask_for_bricks(image)
+        component_disable_mask = component_block_payload.get("disable_mask")
+        brick_input_image = image
+        if component_disable_mask is not None and np.any(component_disable_mask > 0):
+            brick_input_image = self.apply_disable_mask_to_image(image, component_disable_mask)
+
+        det_result, seg_result = self._infer_for_mode("brick_target", brick_input_image)
+        # 시각화는 검은색으로 마스킹된 입력이 아니라 원본 프레임 위에 표시한다.
+        # 실제 추론은 brick_input_image에서 이미 비활성화가 적용된 상태다.
+        try:
+            det_result.orig_img = image.copy()
+        except Exception:
+            pass
+
         if det_result.boxes is None:
             return False, None
 
         detections_for_vis = []
         pre_candidates = []
+
+        for blocked in component_block_payload.get("blocked_regions", []):
+            cx, cy = blocked.get("centroid", (0, 0))
+            color_note = "/".join(blocked.get("active_colors", []))
+            detections_for_vis.append({
+                "u": int(cx),
+                "v": int(cy),
+                "z": 0.0,
+                "yaw": 0.0,
+                "ratio": None,
+                "class_name": f"COMP_BLOCK_{blocked.get('class_name', 'component')}_{color_note}",
+                "is_target": False,
+                "axis_info": None,
+                "is_blocked_region": True,
+                "mask_pts": blocked.get("mask_pts"),
+            })
 
         # ------------------------------------------------------------
         # 1차 필터: live_view id=0 brick 처리와 동일
@@ -301,6 +372,25 @@ class Vision6DPoseManager:
                 target_u=u,
                 target_v=v,
             )
+
+            block_overlap = self.get_disabled_overlap_ratio(
+                mask_pts=mask_pts,
+                bbox_xyxy=xyxy,
+                disabled_mask=component_disable_mask,
+                image_shape=image.shape,
+            )
+            if block_overlap >= self.component_block_overlap_ratio:
+                detections_for_vis.append({
+                    "u": u,
+                    "v": v,
+                    "z": 0.0,
+                    "yaw": 0.0,
+                    "ratio": None,
+                    "class_name": f"{cls_name}_compblock{block_overlap:.2f}",
+                    "is_target": False,
+                    "axis_info": None,
+                })
+                continue
 
             if mask_pts is not None:
                 edge_info = self.get_mask_edge_contact_info(mask_pts, image.shape, self.edge_contact_margin_px)
@@ -423,7 +513,204 @@ class Vision6DPoseManager:
             "all_z_values": all_z_values,
             "det_result": det_result,
             "target_label": f"{class_name} (brick live0-style)",
+            "component_block_payload": component_block_payload,
         }
+
+    def build_component_color_disable_mask_for_bricks(self, image_bgr):
+        """Brick 서비스 전용 component 기반 비활성화 mask 생성.
+
+        흐름:
+          1. COMP_MODEL_PATH 모델을 원본 프레임에 먼저 실행한다.
+          2. component segmentation mask 내부에서 red/yellow/green/blue HSV H 영역을 계산한다.
+          3. 충분히 큰 색 영역이 2개 이상이면 다색 조립체로 판단한다.
+          4. 해당 component segmentation mask만 brick YOLO 입력에서 제거할 disable_mask에 합친다.
+
+        단색으로 판단되는 component mask는 단일 브릭 오검출 가능성이 있으므로 제거하지 않는다.
+        """
+        h, w = image_bgr.shape[:2]
+        empty_mask = np.zeros((h, w), dtype=np.uint8)
+        payload = {
+            "disable_mask": empty_mask,
+            "blocked_regions": [],
+            "kept_regions": [],
+            "comp_result": None,
+        }
+
+        if not self.use_component_color_block_filter:
+            return payload
+
+        try:
+            comp_result = self.model_comp(image_bgr, verbose=False)[0]
+        except Exception as exc:
+            self._log_warn(f"component pre-filter inference failed; brick search continues without block mask: {exc}")
+            return payload
+
+        payload["comp_result"] = comp_result
+        if comp_result.boxes is None:
+            return payload
+
+        for comp_idx, box in enumerate(comp_result.boxes):
+            cls_name = comp_result.names[int(box.cls[0])]
+            if not self._is_allowed_component_class(cls_name):
+                continue
+
+            xyxy = box.xyxy[0].cpu().numpy()
+            bbox_u = int((xyxy[0] + xyxy[2]) / 2)
+            bbox_v = int((xyxy[1] + xyxy[3]) / 2)
+            mask_pts = self.get_matching_mask_points(comp_result, comp_result, comp_idx, bbox_u, bbox_v)
+            if mask_pts is None or len(mask_pts) < 3:
+                continue
+
+            analysis = self.analyze_component_mask_hsv_color_distribution(image_bgr, mask_pts)
+            if analysis is None:
+                continue
+
+            region_info = {
+                "class_name": str(cls_name),
+                "mask_pts": mask_pts,
+                "centroid": analysis["centroid"],
+                "mask_area_px": analysis["mask_area_px"],
+                "active_colors": analysis["active_colors"],
+                "color_stats": analysis["color_stats"],
+                "is_multicolor_component": analysis["is_multicolor_component"],
+            }
+
+            if analysis["is_multicolor_component"]:
+                payload["blocked_regions"].append(region_info)
+                payload["disable_mask"] = cv2.bitwise_or(payload["disable_mask"], analysis["object_mask"])
+            else:
+                payload["kept_regions"].append(region_info)
+
+        if self.component_disable_dilate_px > 0 and np.any(payload["disable_mask"] > 0):
+            k = int(self.component_disable_dilate_px) * 2 + 1
+            kernel = np.ones((k, k), np.uint8)
+            payload["disable_mask"] = cv2.dilate(payload["disable_mask"], kernel, iterations=1)
+
+        if payload["blocked_regions"]:
+            notes = []
+            for item in payload["blocked_regions"]:
+                stats = item.get("color_stats", {})
+                color_notes = []
+                for cname in item.get("active_colors", []):
+                    ratio = stats.get(cname, {}).get("pixel_ratio", 0.0)
+                    color_notes.append(f"{cname}:{ratio:.2f}")
+                notes.append(f"{item.get('class_name')}({','.join(color_notes)})")
+            self._log_info(f"component color block mask applied: {'; '.join(notes)}")
+
+        return payload
+
+    def analyze_component_mask_hsv_color_distribution(self, image_bgr, mask_pts):
+        """Component segmentation 내부의 HSV 4색 분포를 계산한다.
+
+        색 판단은 extract_color_mask()와 같은 H 중심 원형 거리 방식을 사용한다.
+        active color 조건:
+          - object mask 대비 해당 색 픽셀 비율 >= component_color_block_min_color_ratio
+          - 해당 색의 가장 큰 connected region 면적 >= max(min_region_area_px, mask_area * min_region_ratio)
+
+        active color가 component_color_block_min_colors개 이상이면 다색 조립체로 판단한다.
+        """
+        object_mask, contour = self.mask_points_to_mask_and_contour(mask_pts, image_bgr.shape[:2])
+        if contour is None:
+            return None
+
+        mask_area_px = int(np.count_nonzero(object_mask > 0))
+        if mask_area_px < self.component_color_block_min_mask_area_px:
+            return None
+
+        centroid = self.contour_centroid(contour)
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((3, 3), np.uint8)
+
+        color_stats = {}
+        active_colors = []
+        min_region_area = max(
+            float(self.component_color_block_min_region_area_px),
+            float(mask_area_px) * float(self.component_color_block_min_region_ratio),
+        )
+
+        for color_name in COMPONENT_COLOR_BLOCK_COLORS:
+            raw_color_mask = self.extract_color_mask(hsv, color_name)
+            color_mask = cv2.bitwise_and(raw_color_mask, raw_color_mask, mask=object_mask)
+            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            color_pixel_area = int(np.count_nonzero(color_mask > 0))
+            pixel_ratio = float(color_pixel_area / max(mask_area_px, 1))
+
+            cnts, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            large_regions = []
+            largest_region_area = 0.0
+            for cnt in cnts:
+                area = float(cv2.contourArea(cnt))
+                largest_region_area = max(largest_region_area, area)
+                if area >= min_region_area:
+                    large_regions.append(cnt)
+
+            is_active = (
+                pixel_ratio >= self.component_color_block_min_color_ratio and
+                largest_region_area >= min_region_area
+            )
+            if is_active:
+                active_colors.append(color_name)
+
+            color_stats[color_name] = {
+                "pixel_area": color_pixel_area,
+                "pixel_ratio": pixel_ratio,
+                "largest_region_area": float(largest_region_area),
+                "large_region_count": int(len(large_regions)),
+                "is_active": bool(is_active),
+            }
+
+        return {
+            "object_mask": object_mask,
+            "contour": contour,
+            "centroid": centroid,
+            "mask_area_px": mask_area_px,
+            "color_stats": color_stats,
+            "active_colors": active_colors,
+            "is_multicolor_component": len(active_colors) >= self.component_color_block_min_colors,
+        }
+
+    @staticmethod
+    def apply_disable_mask_to_image(image_bgr, disable_mask):
+        """disable_mask 영역을 검은색으로 만들어 brick YOLO 입력에서 비활성화한다."""
+        if disable_mask is None or not np.any(disable_mask > 0):
+            return image_bgr
+        masked = image_bgr.copy()
+        masked[disable_mask > 0] = (0, 0, 0)
+        return masked
+
+    def get_disabled_overlap_ratio(self, mask_pts, bbox_xyxy, disabled_mask, image_shape):
+        """brick 후보가 component disable_mask와 얼마나 겹치는지 계산한다.
+
+        brick segmentation mask가 있으면 mask 기준, 없으면 bbox 기준으로 계산한다.
+        YOLO 입력에서 이미 제거했더라도, 혹시 남는 후보를 2차로 막기 위한 안전장치다.
+        """
+        if disabled_mask is None or not np.any(disabled_mask > 0):
+            return 0.0
+
+        h, w = image_shape[:2]
+        candidate_mask = np.zeros((h, w), dtype=np.uint8)
+        if mask_pts is not None and len(mask_pts) >= 3:
+            poly = np.int32(mask_pts).reshape(-1, 1, 2)
+            cv2.fillPoly(candidate_mask, [poly], 255)
+        elif bbox_xyxy is not None:
+            x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+            x1 = max(0, min(w - 1, x1))
+            x2 = max(0, min(w - 1, x2))
+            y1 = max(0, min(h - 1, y1))
+            y2 = max(0, min(h - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+            candidate_mask[y1:y2 + 1, x1:x2 + 1] = 255
+        else:
+            return 0.0
+
+        candidate_area = int(np.count_nonzero(candidate_mask > 0))
+        if candidate_area <= 0:
+            return 0.0
+        overlap_area = int(np.count_nonzero(np.logical_and(candidate_mask > 0, disabled_mask > 0)))
+        return float(overlap_area / max(candidate_area, 1))
 
     def run_single_frame_component_by_id(self, target_id, visualize=True, wait_ms=5000):
         class_name = ID_TO_CLASS.get(int(target_id))
@@ -1419,6 +1706,20 @@ class Vision6DPoseManager:
     ):
         image = det_result.plot()
         height, width = image.shape[:2]
+
+        # component pre-filter로 막힌 영역은 원본 프레임 위에 반투명 polygon으로 표시한다.
+        for det in detections:
+            if not det.get("is_blocked_region"):
+                continue
+            mask_pts = det.get("mask_pts")
+            if mask_pts is None or len(mask_pts) < 3:
+                continue
+            overlay = image.copy()
+            poly = np.int32(mask_pts).reshape(-1, 1, 2)
+            cv2.fillPoly(overlay, [poly], (80, 80, 80))
+            image = cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0)
+            cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
+
         cv2.circle(image, (width // 2, height // 2), 5, (0, 0, 255), -1)
         cv2.putText(
             image,
@@ -1435,8 +1736,12 @@ class Vision6DPoseManager:
         best_v = best["v"] if best is not None else None
         for det in detections:
             u, v = det["u"], det["v"]
-            color = (0, 255, 255) if det["is_target"] else (180, 180, 180)
-            radius = 7 if det["is_target"] else 4
+            if det.get("is_blocked_region"):
+                color = (100, 100, 100)
+                radius = 6
+            else:
+                color = (0, 255, 255) if det["is_target"] else (180, 180, 180)
+                radius = 7 if det["is_target"] else 4
             if best_u == u and best_v == v:
                 color = (0, 0, 255)
                 radius = 9
