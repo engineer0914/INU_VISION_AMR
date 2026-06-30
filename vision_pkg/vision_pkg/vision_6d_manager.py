@@ -350,7 +350,10 @@ class Vision6DPoseManager:
                 })
                 continue
 
-            yaw = self.find_yaw_from_mask_points(mask_pts) if mask_pts is not None else 0.0
+            # [BRICK YAW] ID 1~8 서비스 브릭은 minAreaRect boxPoints 기반 yaw를 사용한다.
+            # - 2x2: 가장 위쪽 꼭짓점에 연결된 두 변 중 영상 Y-축(12시)에 더 가까운 변
+            # - 4x2: 짧은 변(short edge)을 영상 Y-축(12시) 기준으로 계산
+            yaw = self.find_brick_yaw_from_mask_points(cls_name, mask_pts) if mask_pts is not None else 0.0
             pre_candidates.append({
                 "u": u,
                 "v": v,
@@ -602,6 +605,9 @@ class Vision6DPoseManager:
             yaw = 0.0
             if target_mode in {"component_target", "all_components"} and axis_info is not None:
                 yaw = float(axis_info.get("angle_deg", 0.0))
+            elif target_mode == "brick_target" and mask_pts is not None:
+                # 단일 브릭 ID(1~8) 경로에서만 새 minAreaRect boxPoints yaw를 사용한다.
+                yaw = self.find_brick_yaw_from_mask_points(cls_name, mask_pts)
             elif mask_pts is not None:
                 yaw = self.find_yaw_from_mask_points(mask_pts)
 
@@ -747,6 +753,149 @@ class Vision6DPoseManager:
         if yaw < -90.0:
             yaw += 180.0
         return float(yaw)
+
+    def find_brick_yaw_from_mask_points(self, cls_name, mask_pts):
+        """ID 1~8 brick 전용 yaw 계산.
+
+        기존 구조는 유지하고, 브릭 서비스에서 yaw를 반환하는 방식만 바꾼다.
+
+        좌표계/부호 규칙:
+          - 영상처리 좌표계 기준: +x 오른쪽, +y 아래쪽
+          - 12시 방향, 즉 -Y 방향을 0도로 둔다.
+          - 시계방향은 +각도, 반시계방향은 -각도다.
+
+        2x2:
+          - segmentation mask에 minAreaRect를 친다.
+          - boxPoints 4점 중 y가 가장 작은, 즉 가장 위쪽 꼭짓점을 찾는다.
+          - 그 꼭짓점에 연결된 두 변을 각각 직선 축으로 보고, 위쪽(-Y)으로 향하도록 뒤집는다.
+          - 두 변 중 12시 기준선과 더 가까운, 즉 abs(angle)이 더 작은 값을 반환한다.
+
+        4x2:
+          - minAreaRect boxPoints의 4개 변 중 짧은 변(short edge)을 찾는다.
+          - 짧은 변 벡터를 위쪽(-Y) 반평면으로 향하도록 뒤집는다.
+          - 12시 기준 각도를 반환한다.
+        """
+        if mask_pts is None or len(mask_pts) < 3:
+            return 0.0
+
+        rect = cv2.minAreaRect(np.int32(mask_pts))
+        cls_key = self._compact_class_name(cls_name)
+
+        if cls_key.startswith("2x2"):
+            return self.calculate_square_brick_yaw_from_rect(rect)
+        if cls_key.startswith("4x2"):
+            return self.calculate_rect_brick_short_edge_yaw_from_rect(rect)
+
+        # brick class가 아닌 경우에는 기존 방식으로 fallback한다.
+        return self.calculate_refined_yaw(rect)
+
+    def calculate_square_brick_yaw_from_rect(self, rect):
+        """2x2 정사각 브릭 yaw: 가장 위쪽 꼭짓점 기준 인접 두 변 중 12시에 가까운 변."""
+        box = self._ordered_rect_box_points(rect)
+        if box is None or len(box) != 4:
+            return self.calculate_refined_yaw(rect)
+
+        min_y = float(np.min(box[:, 1]))
+        # 축 정렬 상태에서는 위쪽 꼭짓점이 2개가 될 수 있으므로 tolerance를 둔다.
+        top_tol = 1.5
+        top_indices = [idx for idx, pt in enumerate(box) if float(pt[1]) <= min_y + top_tol]
+        if not top_indices:
+            top_indices = [int(np.argmin(box[:, 1]))]
+
+        candidates = []
+        for idx in top_indices:
+            top_pt = box[idx]
+            # box는 중심 기준 각도순으로 정렬되어 있으므로 idx-1, idx+1이 인접 꼭짓점이다.
+            for nidx in ((idx - 1) % 4, (idx + 1) % 4):
+                neighbor_pt = box[nidx]
+                vec = neighbor_pt - top_pt
+                angle = self._undirected_line_angle_to_image_up(vec)
+                if angle is None:
+                    continue
+                candidates.append(float(angle))
+
+        if not candidates:
+            return self.calculate_refined_yaw(rect)
+
+        # 12시 기준선과 가장 가까운 선분을 선택한다.
+        # abs가 같은 완전 대칭 상황에서는 시계방향(+)을 우선해 결과를 결정적으로 만든다.
+        return float(sorted(candidates, key=lambda a: (abs(a), -a))[0])
+
+    def calculate_rect_brick_short_edge_yaw_from_rect(self, rect):
+        """4x2 직사각 브릭 yaw: minAreaRect의 짧은 변 방향을 12시 기준으로 반환."""
+        box = self._ordered_rect_box_points(rect)
+        if box is None or len(box) != 4:
+            return self.calculate_refined_yaw(rect)
+
+        edges = []
+        for idx in range(4):
+            p1 = box[idx]
+            p2 = box[(idx + 1) % 4]
+            vec = p2 - p1
+            length = float(np.linalg.norm(vec))
+            if length < 1e-6:
+                continue
+            edges.append({"vec": vec, "length": length})
+
+        if not edges:
+            return self.calculate_refined_yaw(rect)
+
+        min_len = min(edge["length"] for edge in edges)
+        # 두 개의 짧은 변은 이론상 같은 길이다. 픽셀 반올림/마스크 노이즈를 고려해 5% 여유를 둔다.
+        short_edges = [edge for edge in edges if edge["length"] <= min_len * 1.05]
+
+        candidates = []
+        for edge in short_edges:
+            angle = self._undirected_line_angle_to_image_up(edge["vec"])
+            if angle is not None:
+                candidates.append(float(angle))
+
+        if not candidates:
+            return self.calculate_refined_yaw(rect)
+
+        # 반대쪽 short edge도 같은 축이므로 보통 같은 각도가 나온다.
+        # 노이즈가 있을 경우 12시 기준선에 더 가까운 값을 사용한다.
+        return float(sorted(candidates, key=lambda a: (abs(a), -a))[0])
+
+    @staticmethod
+    def _ordered_rect_box_points(rect):
+        """minAreaRect boxPoints를 중심 기준 각도순으로 정렬해 인접점 관계를 안정화한다."""
+        box = cv2.boxPoints(rect).astype(np.float32)
+        if box.shape[0] != 4:
+            return None
+        center = np.mean(box, axis=0)
+        order = np.argsort(np.arctan2(box[:, 1] - center[1], box[:, 0] - center[0]))
+        return box[order]
+
+    @staticmethod
+    def _undirected_line_angle_to_image_up(vec_xy):
+        """직선/변 벡터를 위쪽(-Y) 반평면으로 뒤집고, 12시 기준 각도를 반환한다.
+
+        반환 범위는 원칙적으로 -90~90도다.
+        0도는 이미지 위쪽(-Y), +는 시계방향, -는 반시계방향이다.
+        """
+        vec = np.array(vec_xy, dtype=np.float32).reshape(2)
+        if float(np.linalg.norm(vec)) < 1e-6:
+            return None
+
+        # 영상 좌표계에서 y가 커지는 방향은 아래쪽이다.
+        # 변은 방향성이 없는 직선으로 취급하므로, 항상 위쪽(-Y)으로 향하게 뒤집는다.
+        if vec[1] > 0.0:
+            vec = -vec
+        elif abs(float(vec[1])) <= 1e-6 and vec[0] < 0.0:
+            # 완전히 수평인 경우에는 오른쪽 방향을 +90도로 통일한다.
+            vec = -vec
+
+        vx, vy = float(vec[0]), float(vec[1])
+        angle = float(np.degrees(np.arctan2(vx, -vy)))
+
+        # undirected line이므로 180도 반대 방향은 같은 축이다.
+        # 따라서 최종적으로 -90~90 범위에 넣는다.
+        if angle > 90.0:
+            angle -= 180.0
+        if angle < -90.0:
+            angle += 180.0
+        return float(angle)
 
     def brick_shape_ratio_pass(self, cls_name, mask_pts):
         ratio = 1.0
