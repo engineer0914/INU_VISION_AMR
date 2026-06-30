@@ -4,7 +4,7 @@
   <name>vision_pkg</name>
   <version>0.0.0</version>
   <description>Vision package</description>
-  <maintainer email="dsp@todo.todo">scr</maintainer>
+  <maintainer email="dsp@todo.todo">dsp</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
