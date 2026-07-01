@@ -19,6 +19,7 @@ COMP_MODEL_PATH = os.path.join(WORKSPACE_DIR, "best_comp.pt")
 BRICK_IDS = {1, 2, 3, 4, 5, 6, 7, 8}
 COMPONENT_IDS = {13, 34, 81, 241, 442, 462, 711, 4482, 8518, 46262, 48132}
 COMPONENT_VIEW_ID = 777
+EMPTY_SPACE_ID = 666
 
 ID_TO_CLASS = {
     1: "2x2_red",
@@ -29,6 +30,7 @@ ID_TO_CLASS = {
     6: "4x2_green",
     7: "4x2_blue",
     8: "4x2_yellow",
+    666: "empty_space",
     777: "components",
     999: "assembly",
     888: "assembly_fine",
@@ -76,12 +78,35 @@ HSV_COLOR_RANGES = HUE_COLOR_PARAMS  # endpoint score 루프 호환용 alias
 # brick YOLO 입력 이미지에서 검은색으로 비활성화한다.
 COMPONENT_COLOR_BLOCK_COLORS = ("red", "yellow", "green", "blue")
 DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLORS = 2
-DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLOR_RATIO = 0.10
+DEFAULT_COMPONENT_COLOR_BLOCK_MIN_COLOR_RATIO = 0.05
 DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_RATIO = 0.04
 DEFAULT_COMPONENT_COLOR_BLOCK_MIN_REGION_AREA_PX = 40
 DEFAULT_COMPONENT_COLOR_BLOCK_MIN_MASK_AREA_PX = 120
 DEFAULT_COMPONENT_BLOCK_OVERLAP_RATIO = 0.20
 DEFAULT_COMPONENT_DISABLE_DILATE_PX = 2
+
+# Service ID 666: grid 기반 빈 공간 탐색 설정.
+# image를 N x N grid로 나누고, 기존 brick 후보 mask가 cell 내부를
+# empty_space_cell_occupied_ratio 이상 차지하면 해당 cell을 비활성화한다.
+
+
+
+
+DEFAULT_EMPTY_SPACE_GRID_DIVISIONS = 5
+# 활성화 영역 정방 수 ex) 5 = 5*5
+
+DEFAULT_EMPTY_SPACE_VISUALIZE_SEC = 3.0
+# 시각화 시간 초단위
+
+DEFAULT_EMPTY_SPACE_CELL_OCCUPIED_RATIO = 0.000001
+# 활성화 영역내 욜로 마스킹이 비활성화 되는 기준 비율
+# ex) 영역이 100픽셀이라할때, 내부에 욜로 결과가 10픽셀이라면 = 0.1
+
+DEFAULT_EMPTY_SPACE_DEPTH_SAMPLE_STEP_PX = 4
+
+
+
+
 
 
 @dataclass
@@ -109,7 +134,7 @@ class Vision6DPoseManager:
         match_distance_px=40.0,
         visualize=False,
         visualize_window="6D Pose (Ensemble Mode)",
-        visualize_scale=2.0,
+        visualize_scale=1.0,
         use_shape_ratio_filter=True,
         shape_ratio_threshold=1.5,
         edge_contact_max_px=10,
@@ -125,6 +150,10 @@ class Vision6DPoseManager:
         component_color_block_min_mask_area_px=DEFAULT_COMPONENT_COLOR_BLOCK_MIN_MASK_AREA_PX,
         component_block_overlap_ratio=DEFAULT_COMPONENT_BLOCK_OVERLAP_RATIO,
         component_disable_dilate_px=DEFAULT_COMPONENT_DISABLE_DILATE_PX,
+        empty_space_grid_divisions=DEFAULT_EMPTY_SPACE_GRID_DIVISIONS,
+        empty_space_cell_occupied_ratio=DEFAULT_EMPTY_SPACE_CELL_OCCUPIED_RATIO,
+        empty_space_visualize_sec=DEFAULT_EMPTY_SPACE_VISUALIZE_SEC,
+        empty_space_depth_sample_step_px=DEFAULT_EMPTY_SPACE_DEPTH_SAMPLE_STEP_PX,
     ):
         self.logger = logger
         self.det_model_path = det_model_path
@@ -151,6 +180,10 @@ class Vision6DPoseManager:
         self.component_color_block_min_mask_area_px = int(component_color_block_min_mask_area_px)
         self.component_block_overlap_ratio = float(component_block_overlap_ratio)
         self.component_disable_dilate_px = int(component_disable_dilate_px)
+        self.empty_space_grid_divisions = max(1, int(empty_space_grid_divisions))
+        self.empty_space_cell_occupied_ratio = float(max(0.0, min(1.0, float(empty_space_cell_occupied_ratio))))
+        self.empty_space_visualize_sec = float(max(0.0, float(empty_space_visualize_sec)))
+        self.empty_space_depth_sample_step_px = max(1, int(empty_space_depth_sample_step_px))
         self.stop_requested = False
         self._pipeline_started = False
 
@@ -198,7 +231,10 @@ class Vision6DPoseManager:
             f"component_color_block_min_colors={self.component_color_block_min_colors}, "
             f"component_color_block_min_color_ratio={self.component_color_block_min_color_ratio}, "
             f"component_color_block_min_region_ratio={self.component_color_block_min_region_ratio}, "
-            f"component_block_overlap_ratio={self.component_block_overlap_ratio}"
+            f"component_block_overlap_ratio={self.component_block_overlap_ratio}, "
+            f"empty_space_grid_divisions={self.empty_space_grid_divisions}, "
+            f"empty_space_cell_occupied_ratio={self.empty_space_cell_occupied_ratio}, "
+            f"empty_space_visualize_sec={self.empty_space_visualize_sec}"
         )
 
     def shutdown(self):
@@ -238,6 +274,7 @@ class Vision6DPoseManager:
 
         분기 규칙:
           - 1~8: brick 전용 단일 프레임 함수
+          - 666: brick grid 기반 빈 공간 탐색 함수
           - 13, 34, ...: component 전용 단일 프레임 함수
 
         component 전용 함수는 live_view_id=777에서 보던 것과 같은 YOLO component model,
@@ -248,6 +285,8 @@ class Vision6DPoseManager:
         except Exception:
             return PoseResult(False, reason=f"invalid target id: {target_id}")
 
+        if target_id == EMPTY_SPACE_ID:
+            return self.run_single_frame_empty_space_by_id(target_id, visualize=visualize, wait_ms=wait_ms)
         if target_id in BRICK_IDS:
             return self.run_single_frame_brick_by_id(target_id, visualize=visualize, wait_ms=wait_ms)
         if target_id in COMPONENT_IDS:
@@ -712,6 +751,579 @@ class Vision6DPoseManager:
         overlap_area = int(np.count_nonzero(np.logical_and(candidate_mask > 0, disabled_mask > 0)))
         return float(overlap_area / max(candidate_area, 1))
 
+    def run_single_frame_empty_space_by_id(self, target_id=EMPTY_SPACE_ID, visualize=True, wait_ms=5000):
+        """Service ID 666: grid 기반 빈 공간 pose 반환.
+
+        기존 brick 인식 구조를 그대로 재사용한다.
+          - component color block pre-filter는 최근 brick branch와 동일하게 먼저 수행한다.
+          - brick YOLO det/seg 결과에서 brick class만 사용한다.
+          - segmentation edge contact filter를 통과한 후보만 사용한다.
+          - 2x2/4x2 class별 minAreaRect ratio filter를 통과한 후보만 사용한다.
+
+        차이점:
+          - 특정 brick class를 반환하지 않는다.
+          - 통과한 brick contour가 grid cell 내부를 일정 비율 이상 차지하면 해당 cell을 비활성화한다.
+          - 남은 cell들의 connected component 중 가장 큰 빈 영역을 찾는다.
+          - 그 빈 영역 중심에 가장 가까운 grid cell의 중앙 pixel을 X/Y/Z 반환 기준점으로 사용한다.
+          - yaw는 0도로 고정한다.
+        """
+        class_name = ID_TO_CLASS.get(EMPTY_SPACE_ID, "empty_space")
+        self._log_info(
+            f"single-frame empty-space grid search: id={target_id}, "
+            f"grid={self.empty_space_grid_divisions}x{self.empty_space_grid_divisions}, "
+            f"occupied_ratio={self.empty_space_cell_occupied_ratio:.2f}"
+        )
+
+        try:
+            ok, payload = self._process_one_frame_empty_space_666()
+        except Exception as exc:
+            self._log_warn(f"single-frame empty-space failed: {exc}")
+            return PoseResult(False, target_id=target_id, class_name=class_name, reason=str(exc))
+
+        result = self._pose_result_from_payload(target_id, class_name, payload if ok else None)
+
+        # 666은 서비스 디버깅 용도로 기본 1초 시각화를 수행한다.
+        # empty_space_visualize_sec=0.0 으로 주면 완전히 꺼진다.
+        if self.empty_space_visualize_sec > 0.0 and payload is not None:
+            self.show_empty_space_666_visualization(
+                image_bgr=payload.get("image"),
+                grid_payload=payload.get("grid_payload"),
+                brick_debug=payload.get("brick_debug", []),
+                result=result,
+                wait_ms=int(round(self.empty_space_visualize_sec * 1000.0)),
+                close_after=True,
+            )
+        return result
+
+    def _process_one_frame_empty_space_666(self):
+        """666 빈 공간 탐색의 실제 1-frame 처리."""
+        frames = self.pipeline.wait_for_frames(timeout_ms=500)
+        aligned = self.align.process(frames)
+        depth_frame = aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+        if not color_frame or not depth_frame:
+            return False, None
+
+        image = np.asanyarray(color_frame.get_data())
+        h, w = image.shape[:2]
+
+        # 666에서는 component 다색 영역을 "브릭 YOLO 입력에서 제거"하지 않는다.
+        # 이유:
+        #   일반 brick 서비스(ID 1~8)는 조립체 상부가 brick처럼 오검출되는 것을 막아야 하므로
+        #   component color block mask를 brick 입력 이미지에 적용한다.
+        #   하지만 666 empty-space 서비스는 물체가 있는 모든 칸을 비워두면 안 되므로,
+        #   조립체 상부가 brick YOLO에 잡혀도 grid occupied로 처리하는 쪽이 안전하다.
+        # 따라서 component mask는 occupied_mask에는 포함하되,
+        # brick YOLO는 원본 image에 그대로 실행한다.
+        component_block_payload = self.build_component_color_disable_mask_for_bricks(image)
+        component_disable_mask = component_block_payload.get("disable_mask")
+
+        det_result, seg_result = self._infer_for_mode("brick_target", image)
+        try:
+            det_result.orig_img = image.copy()
+        except Exception:
+            pass
+
+        occupied_mask = np.zeros((h, w), dtype=np.uint8)
+        brick_debug = []
+
+        # component pre-filter로 막은 다색 조립체 영역도 occupied로 취급한다.
+        if component_disable_mask is not None and np.any(component_disable_mask > 0):
+            occupied_mask = cv2.bitwise_or(occupied_mask, component_disable_mask)
+            for blocked in component_block_payload.get("blocked_regions", []):
+                brick_debug.append({
+                    "kind": "component_block",
+                    "class_name": str(blocked.get("class_name", "component")),
+                    "mask_pts": blocked.get("mask_pts"),
+                    "centroid": blocked.get("centroid", (0, 0)),
+                    "note": "/".join(blocked.get("active_colors", [])),
+                })
+
+        if det_result.boxes is not None:
+            for det_idx, box in enumerate(det_result.boxes):
+                cls_name = det_result.names[int(box.cls[0])]
+                compact_key = self._compact_class_name(cls_name)
+                if not (compact_key.startswith("2x2") or compact_key.startswith("4x2")):
+                    continue
+
+                xyxy = box.xyxy[0].cpu().numpy()
+                u = int((xyxy[0] + xyxy[2]) / 2)
+                v = int((xyxy[1] + xyxy[3]) / 2)
+
+                mask_pts = self.get_matching_mask_points(
+                    det_result=det_result,
+                    seg_result=seg_result,
+                    det_idx=det_idx,
+                    target_u=u,
+                    target_v=v,
+                )
+
+                # 666에서는 component disable mask와 겹친다는 이유로 brick 후보를 버리지 않는다.
+                # 이 overlap rejection은 ID 1~8 brick pick용 오검출 방지에는 필요하지만,
+                # empty-space 탐색에서는 조립체 상부/브릭 상부가 잡힌 칸도 실제 점유 공간이므로
+                # 그대로 occupied_mask에 반영하는 것이 목적에 맞다.
+                ratio = None
+                if mask_pts is not None:
+                    edge_info = self.get_mask_edge_contact_info(mask_pts, image.shape, 0)
+                    if edge_info["max_px"] > self.edge_contact_max_px:
+                        brick_debug.append({
+                            "kind": "rejected",
+                            "class_name": f"{cls_name}_edge{edge_info['max_px']}px",
+                            "u": u,
+                            "v": v,
+                            "mask_pts": mask_pts,
+                            "bbox_xyxy": xyxy,
+                        })
+                        continue
+
+                    if False:
+                        shape_ok, ratio = self.brick_shape_ratio_pass(cls_name, mask_pts)
+                        if not shape_ok:
+                            brick_debug.append({
+                                "kind": "rejected",
+                                "class_name": f"{cls_name}_shape_r{ratio:.2f}",
+                                "u": u,
+                                "v": v,
+                                "mask_pts": mask_pts,
+                                "bbox_xyxy": xyxy,
+                            })
+                            continue
+                    else:
+                        _, ratio = self.brick_shape_ratio_pass(cls_name, mask_pts)
+                elif self.use_shape_ratio_filter:
+                    # segmentation contour가 없으면 class/ratio 비교를 할 수 없으므로 bbox fallback만 debug에 남긴다.
+                    # 그래도 YOLO bbox가 확실히 잡힌 경우 workspace 점유로 보는 것이 안전하다.
+                    ratio = None
+
+                candidate_mask = self.build_candidate_mask_from_mask_or_bbox(mask_pts, xyxy, image.shape)
+                if candidate_mask is None or not np.any(candidate_mask > 0):
+                    continue
+
+                occupied_mask = cv2.bitwise_or(occupied_mask, candidate_mask)
+                brick_debug.append({
+                    "kind": "occupied_brick",
+                    "class_name": str(cls_name),
+                    "u": u,
+                    "v": v,
+                    "mask_pts": mask_pts,
+                    "bbox_xyxy": xyxy,
+                    "ratio": ratio,
+                })
+
+        grid_payload = self.build_empty_space_grid_payload(
+            image_shape=image.shape,
+            occupied_mask=occupied_mask,
+            depth_frame=depth_frame,
+        )
+        grid_payload["component_block_payload"] = component_block_payload
+        grid_payload["occupied_mask"] = occupied_mask
+
+        if not grid_payload.get("success", False):
+            return True, {
+                "valid_targets": [],
+                "all_z_values": [],
+                "best": None,
+                "detections": [],
+                "det_result": det_result,
+                "target_label": "empty_space_grid",
+                "image": image,
+                "grid_payload": grid_payload,
+                "brick_debug": brick_debug,
+                "reason": grid_payload.get("reason", "empty space search failed"),
+            }
+
+        selected = grid_payload["selected"]
+        selected_target = {
+            "u": int(selected["u"]),
+            "v": int(selected["v"]),
+            "z": float(selected["z"]),
+            "yaw": 0.0,
+            "detected_class": "empty_space",
+            "class_key": "empty_space",
+            "is_target": True,
+            "axis_info": None,
+            "mask_pts": None,
+        }
+
+        return True, {
+            "valid_targets": [selected_target],
+            "all_z_values": [float(selected["z"])],
+            "best": selected_target,
+            "detections": [],
+            "det_result": det_result,
+            "target_label": "empty_space_grid",
+            "image": image,
+            "grid_payload": grid_payload,
+            "brick_debug": brick_debug,
+        }
+
+    def build_candidate_mask_from_mask_or_bbox(self, mask_pts, bbox_xyxy, image_shape):
+        """brick segmentation mask가 있으면 mask, 없으면 bbox로 candidate occupied mask를 만든다."""
+        h, w = image_shape[:2]
+        candidate_mask = np.zeros((h, w), dtype=np.uint8)
+        if mask_pts is not None and len(mask_pts) >= 3:
+            poly = np.int32(mask_pts).reshape(-1, 1, 2)
+            cv2.fillPoly(candidate_mask, [poly], 255)
+            return candidate_mask
+
+        if bbox_xyxy is None:
+            return None
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w - 1, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        candidate_mask[y1:y2 + 1, x1:x2 + 1] = 255
+        return candidate_mask
+
+    def build_empty_space_grid_payload(self, image_shape, occupied_mask, depth_frame):
+        """occupied_mask를 N x N grid로 변환하고 가장 큰 빈 grid connected area를 찾는다."""
+        h, w = image_shape[:2]
+        n = max(1, int(self.empty_space_grid_divisions))
+        cells = self.build_grid_cells(image_shape, n)
+
+        disabled_grid = np.zeros((n, n), dtype=bool)
+        occupancy_ratio_grid = np.zeros((n, n), dtype=np.float32)
+
+        for cell in cells:
+            row = cell["row"]
+            col = cell["col"]
+            x1, y1, x2, y2 = cell["rect"]
+            cell_area = max(1, int((x2 - x1) * (y2 - y1)))
+            occupied_area = int(np.count_nonzero(occupied_mask[y1:y2, x1:x2] > 0))
+            ratio = float(occupied_area / cell_area)
+            occupancy_ratio_grid[row, col] = ratio
+            if ratio >= self.empty_space_cell_occupied_ratio:
+                disabled_grid[row, col] = True
+
+        free_grid = np.logical_not(disabled_grid)
+        components = self.find_grid_connected_components(free_grid)
+        if not components:
+            return {
+                "success": False,
+                "reason": "no empty grid cells",
+                "cells": cells,
+                "disabled_grid": disabled_grid,
+                "occupancy_ratio_grid": occupancy_ratio_grid,
+                "components": [],
+                "selected_component": [],
+                "selected_cell": None,
+            }
+
+        image_center = np.array([w * 0.5, h * 0.5], dtype=np.float32)
+        scored_components = []
+        for comp in components:
+            centers = np.array([self.grid_cell_center(cells, row, col) for row, col in comp], dtype=np.float32)
+            comp_center = np.mean(centers, axis=0)
+            dist_to_image_center = float(np.linalg.norm(comp_center - image_center))
+            scored_components.append({
+                "cells_rc": comp,
+                "cell_count": int(len(comp)),
+                "center_xy": comp_center,
+                "dist_to_image_center": dist_to_image_center,
+            })
+
+        # 1순위: cell 수가 가장 많은 빈 영역. 동률이면 화면 중심에 가까운 영역.
+        best_component = sorted(
+            scored_components,
+            key=lambda item: (-item["cell_count"], item["dist_to_image_center"]),
+        )[0]
+
+        region_center = best_component["center_xy"]
+        selected_rc = min(
+            best_component["cells_rc"],
+            key=lambda rc: float(np.linalg.norm(np.array(self.grid_cell_center(cells, rc[0], rc[1]), dtype=np.float32) - region_center)),
+        )
+        selected_cell = self.get_grid_cell(cells, selected_rc[0], selected_rc[1])
+        sx1, sy1, sx2, sy2 = selected_cell["rect"]
+        u = int(round((sx1 + sx2 - 1) * 0.5))
+        v = int(round((sy1 + sy2 - 1) * 0.5))
+        z = self.get_valid_depth_in_rect(depth_frame, u, v, selected_cell["rect"], image_shape)
+
+        if z <= 0.0:
+            return {
+                "success": False,
+                "reason": "invalid depth at selected empty grid cell",
+                "cells": cells,
+                "disabled_grid": disabled_grid,
+                "occupancy_ratio_grid": occupancy_ratio_grid,
+                "components": scored_components,
+                "selected_component": best_component["cells_rc"],
+                "selected_cell": selected_cell,
+                "selected": {"u": u, "v": v, "z": 0.0, "yaw": 0.0, "cell_rc": selected_rc},
+            }
+
+        return {
+            "success": True,
+            "reason": "ok",
+            "cells": cells,
+            "disabled_grid": disabled_grid,
+            "occupancy_ratio_grid": occupancy_ratio_grid,
+            "components": scored_components,
+            "selected_component": best_component["cells_rc"],
+            "selected_cell": selected_cell,
+            "selected": {"u": u, "v": v, "z": float(z), "yaw": 0.0, "cell_rc": selected_rc},
+        }
+
+    @staticmethod
+    def build_grid_cells(image_shape, divisions):
+        """image 전체를 divisions x divisions grid cell 목록으로 나눈다."""
+        h, w = image_shape[:2]
+        n = max(1, int(divisions))
+        cells = []
+        for row in range(n):
+            y1 = int(round(row * h / n))
+            y2 = int(round((row + 1) * h / n))
+            for col in range(n):
+                x1 = int(round(col * w / n))
+                x2 = int(round((col + 1) * w / n))
+                cells.append({
+                    "row": row,
+                    "col": col,
+                    "rect": (x1, y1, x2, y2),
+                })
+        return cells
+
+    @staticmethod
+    def get_grid_cell(cells, row, col):
+        for cell in cells:
+            if cell["row"] == row and cell["col"] == col:
+                return cell
+        return None
+
+    @staticmethod
+    def grid_cell_center(cells, row, col):
+        cell = Vision6DPoseManager.get_grid_cell(cells, row, col)
+        x1, y1, x2, y2 = cell["rect"]
+        return (float((x1 + x2 - 1) * 0.5), float((y1 + y2 - 1) * 0.5))
+
+    @staticmethod
+    def find_grid_connected_components(free_grid):
+        """4-neighbor 기준으로 빈 grid cell connected components를 찾는다."""
+        free_grid = np.asarray(free_grid, dtype=bool)
+        n_rows, n_cols = free_grid.shape[:2]
+        visited = np.zeros_like(free_grid, dtype=bool)
+        components = []
+
+        for row in range(n_rows):
+            for col in range(n_cols):
+                if visited[row, col] or not free_grid[row, col]:
+                    continue
+                q = [(row, col)]
+                visited[row, col] = True
+                comp = []
+                while q:
+                    r, c = q.pop(0)
+                    comp.append((r, c))
+                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                        if nr < 0 or nr >= n_rows or nc < 0 or nc >= n_cols:
+                            continue
+                        if visited[nr, nc] or not free_grid[nr, nc]:
+                            continue
+                        visited[nr, nc] = True
+                        q.append((nr, nc))
+                components.append(comp)
+        return components
+
+    def get_valid_depth_in_rect(self, depth_frame, u, v, rect_xyxy, image_shape):
+        """선택 grid cell 중심 depth가 없으면 cell 내부 유효 depth들의 median으로 보강한다."""
+        z = self.get_valid_depth(depth_frame, int(u), int(v), search_radius=15)
+        if z > 0.0:
+            return float(z)
+
+        h, w = image_shape[:2]
+        x1, y1, x2, y2 = [int(vv) for vv in rect_xyxy]
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h, y2))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        # cell border에 걸친 물체/edge depth를 줄이기 위해 안쪽 15%만 먼저 샘플한다.
+        pad_x = int(round((x2 - x1) * 0.15))
+        pad_y = int(round((y2 - y1) * 0.15))
+        sx1 = min(max(x1 + pad_x, x1), x2 - 1)
+        sx2 = max(min(x2 - pad_x, x2), sx1 + 1)
+        sy1 = min(max(y1 + pad_y, y1), y2 - 1)
+        sy2 = max(min(y2 - pad_y, y2), sy1 + 1)
+
+        vals = []
+        step = max(1, int(self.empty_space_depth_sample_step_px))
+        for yy in range(sy1, sy2, step):
+            for xx in range(sx1, sx2, step):
+                zz = depth_frame.get_distance(int(xx), int(yy))
+                if zz > 0.0:
+                    vals.append(float(zz))
+        if vals:
+            return float(np.median(np.array(vals, dtype=np.float32)))
+        return 0.0
+
+    def show_empty_space_666_visualization(
+        self,
+        image_bgr,
+        grid_payload,
+        brick_debug=None,
+        result=None,
+        wait_ms=1000,
+        close_after=True,
+    ):
+        """666 전용 grid 시각화.
+
+        - 비활성 cell: 빨강 테두리
+        - 선택된 최대 빈 connected area: 옅은 노랑
+        - 최종 반환 cell: 초록색
+        - X/Y/Z/Yaw 결과를 cv2 text로 출력
+        """
+        if image_bgr is None or grid_payload is None:
+            return
+
+        image = image_bgr.copy()
+        h, w = image.shape[:2]
+        overlay = image.copy()
+        cells = grid_payload.get("cells", [])
+        disabled_grid = grid_payload.get("disabled_grid")
+        selected_component = set(tuple(rc) for rc in grid_payload.get("selected_component", []))
+        selected_cell = grid_payload.get("selected_cell")
+        selected = grid_payload.get("selected") or {}
+        occupancy_ratio_grid = grid_payload.get("occupancy_ratio_grid")
+
+        # component block / accepted brick contour를 얇게 표시해서 왜 cell이 막혔는지 볼 수 있게 한다.
+        if brick_debug is None:
+            brick_debug = []
+        for item in brick_debug:
+            mask_pts = item.get("mask_pts")
+            if mask_pts is None or len(mask_pts) < 3:
+                continue
+            poly = np.int32(mask_pts).reshape(-1, 1, 2)
+            if item.get("kind") == "component_block":
+                cv2.polylines(image, [poly], True, (0, 0, 255), 1, cv2.LINE_AA)
+            elif item.get("kind") == "occupied_brick":
+                cv2.polylines(image, [poly], True, (255, 180, 0), 1, cv2.LINE_AA)
+
+        # 최대 빈 영역은 옅은 노랑 fill.
+        for cell in cells:
+            row = cell["row"]
+            col = cell["col"]
+            x1, y1, x2, y2 = cell["rect"]
+            if (row, col) in selected_component:
+                cv2.rectangle(overlay, (x1 + 2, y1 + 2), (x2 - 3, y2 - 3), (0, 255, 255), -1)
+
+        image = cv2.addWeighted(overlay, 0.22, image, 0.78, 0.0)
+
+        # grid line
+        n = max(1, int(self.empty_space_grid_divisions))
+        for i in range(n + 1):
+            x = int(round(i * w / n))
+            y = int(round(i * h / n))
+            cv2.line(image, (x, 0), (x, h - 1), (160, 160, 160), 1, cv2.LINE_AA)
+            cv2.line(image, (0, y), (w - 1, y), (160, 160, 160), 1, cv2.LINE_AA)
+
+        # disabled cell red border + occupancy ratio
+        for cell in cells:
+            row = cell["row"]
+            col = cell["col"]
+            x1, y1, x2, y2 = cell["rect"]
+            disabled = False
+            if disabled_grid is not None:
+                disabled = bool(disabled_grid[row, col])
+            if disabled:
+                cv2.rectangle(image, (x1 + 3, y1 + 3), (x2 - 4, y2 - 4), (0, 0, 255), 2, cv2.LINE_AA)
+            if occupancy_ratio_grid is not None:
+                ratio = float(occupancy_ratio_grid[row, col])
+                if ratio > 0.0:
+                    cv2.putText(
+                        image,
+                        f"{ratio:.2f}",
+                        (x1 + 6, y1 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (0, 0, 255) if disabled else (80, 80, 80),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        # selected return cell green.
+        if selected_cell is not None:
+            x1, y1, x2, y2 = selected_cell["rect"]
+            green_overlay = image.copy()
+            cv2.rectangle(green_overlay, (x1 + 5, y1 + 5), (x2 - 6, y2 - 6), (0, 255, 0), -1)
+            image = cv2.addWeighted(green_overlay, 0.28, image, 0.72, 0.0)
+            cv2.rectangle(image, (x1 + 5, y1 + 5), (x2 - 6, y2 - 6), (0, 255, 0), 3, cv2.LINE_AA)
+
+        if selected:
+            u = int(selected.get("u", 0))
+            v = int(selected.get("v", 0))
+            cv2.circle(image, (u, v), 7, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(image, (u, v), 12, (0, 120, 0), 2, cv2.LINE_AA)
+
+        # result text
+        cv2.putText(
+            image,
+            f"target: 666 empty_space_grid  grid={self.empty_space_grid_divisions}x{self.empty_space_grid_divisions}  occ>={self.empty_space_cell_occupied_ratio:.2f}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        if result is not None and result.success:
+            lines = [
+                f"SERVICE RESULT: id=666 class=empty_space",
+                f"X={result.x_m*1000.0:.1f}mm  Y={result.y_m*1000.0:.1f}mm  Z={result.z_m*1000.0:.1f}mm  Yaw={result.yaw_deg:.1f}deg",
+            ]
+            color = (0, 255, 0)
+        else:
+            reason = result.reason if result is not None else grid_payload.get("reason", "unknown")
+            lines = [
+                "SERVICE RESULT: FAILED id=666 class=empty_space",
+                f"Reason: {reason}",
+            ]
+            color = (0, 165, 255)
+
+        y0 = max(60, h - 48)
+        for idx, line in enumerate(lines):
+            cv2.putText(
+                image,
+                line,
+                (12, y0 + idx * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        if self.visualize_scale != 1.0:
+            image = cv2.resize(image, None, fx=self.visualize_scale, fy=self.visualize_scale, interpolation=cv2.INTER_LINEAR)
+
+        cv2.imshow(self.visualize_window, image)
+        wait_ms = int(wait_ms) if wait_ms is not None else 1
+        if wait_ms <= 1:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                self._log_info("OpenCV q/ESC pressed. Stop requested.")
+                self.stop_requested = True
+        else:
+            start = time.time()
+            while (time.time() - start) * 1000.0 < wait_ms:
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q') or key == 27:
+                    self._log_info("OpenCV q/ESC pressed. Stop requested.")
+                    self.stop_requested = True
+                    break
+            if close_after:
+                try:
+                    cv2.destroyWindow(self.visualize_window)
+                    for _ in range(3):
+                        cv2.waitKey(1)
+                except Exception:
+                    pass
+
     def run_single_frame_component_by_id(self, target_id, visualize=True, wait_ms=5000):
         class_name = ID_TO_CLASS.get(int(target_id))
         if class_name is None:
@@ -748,7 +1360,8 @@ class Vision6DPoseManager:
 
         valid_targets = vis_payload.get("valid_targets", [])
         if not valid_targets:
-            return PoseResult(False, target_id=target_id, class_name=class_name, reason="target not detected in this frame")
+            reason = vis_payload.get("reason", "target not detected in this frame")
+            return PoseResult(False, target_id=target_id, class_name=class_name, reason=reason)
 
         # 같은 class가 여러 개 보이면 가까운 객체를 반환한다.
         best_target = min(valid_targets, key=lambda item: item["z"] if item["z"] > 0.0 else float("inf"))
@@ -972,6 +1585,8 @@ class Vision6DPoseManager:
             return "all_bricks"
         if target_id == COMPONENT_VIEW_ID:
             return "all_components"
+        if target_id == EMPTY_SPACE_ID:
+            return "empty_space"
         if target_id in BRICK_IDS:
             return "brick_target"
         if target_id in COMPONENT_IDS:
@@ -983,6 +1598,8 @@ class Vision6DPoseManager:
             return "all bricks"
         if target_mode == "all_components":
             return "all components"
+        if target_mode == "empty_space":
+            return "empty space grid"
         return ID_TO_CLASS.get(target_id, str(target_id))
 
     def _is_target_candidate(self, target_mode, target_key, cls_name, cls_key):
@@ -1737,7 +2354,7 @@ class Vision6DPoseManager:
         for det in detections:
             u, v = det["u"], det["v"]
             if det.get("is_blocked_region"):
-                color = (100, 100, 100)
+                color = (0, 0, 255)
                 radius = 6
             else:
                 color = (0, 255, 255) if det["is_target"] else (180, 180, 180)

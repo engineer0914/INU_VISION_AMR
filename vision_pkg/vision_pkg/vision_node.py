@@ -7,6 +7,7 @@ from arm_interfaces.srv import GetTargetPose
 from vision_pkg.vision_6d_manager import (
     BRICK_IDS,
     COMPONENT_IDS,
+    EMPTY_SPACE_ID,
     COMP_MODEL_PATH,
     DET_MODEL_PATH,
     ID_TO_CLASS,
@@ -25,9 +26,9 @@ class VisionNode(Node):
         self.declare_parameter('seg_model_path', SEG_MODEL_PATH)
         self.declare_parameter('comp_model_path', COMP_MODEL_PATH)
         self.declare_parameter('visualize_window', '6D Pose Service Result')
-        self.declare_parameter('visualize_scale', 2.0)
+        self.declare_parameter('visualize_scale', 1.0)
         self.declare_parameter('service_visualize', True)
-        self.declare_parameter('service_result_display_sec', 5.0)
+        self.declare_parameter('service_result_display_sec', 0.01)
         self.declare_parameter('use_shape_ratio_filter', True)
         self.declare_parameter('shape_ratio_threshold', 1.5)
         self.declare_parameter('edge_contact_max_px', 10)
@@ -97,6 +98,15 @@ class VisionNode(Node):
                     f'[VISION] branch=COMPONENT single-frame 777-style axis pipeline, ID={target_id}, class={ID_TO_CLASS.get(target_id)}'
                 )
                 result = self.vision.run_single_frame_component_by_id(
+                    target_id=target_id,
+                    visualize=service_visualize,
+                    wait_ms=wait_ms,
+                )
+            elif target_id == EMPTY_SPACE_ID:
+                self.get_logger().info(
+                    f'[VISION] branch=empty space single-frame 777-style axis pipeline, ID={target_id}, class={ID_TO_CLASS.get(target_id)}'
+                )
+                result = self.vision.run_single_frame_empty_space_by_id(
                     target_id=target_id,
                     visualize=service_visualize,
                     wait_ms=wait_ms,
