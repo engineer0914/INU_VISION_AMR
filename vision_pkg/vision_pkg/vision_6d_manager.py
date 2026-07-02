@@ -979,7 +979,22 @@ class Vision6DPoseManager:
         return candidate_mask
 
     def build_empty_space_grid_payload(self, image_shape, occupied_mask, depth_frame):
-        """occupied_mask를 N x N grid로 변환하고 가장 큰 빈 grid connected area를 찾는다."""
+        """occupied_mask를 N x N grid로 변환하고 중앙 우선 순서로 빈 cell을 선택한다.
+
+        기존의 비활성화 구조는 그대로 유지한다.
+          - occupied_mask가 cell 내부를 empty_space_cell_occupied_ratio 이상 차지하면 disabled 처리한다.
+          - free_grid / connected component 계산은 시각화와 debug를 위해 그대로 만든다.
+
+        선택 방식만 변경한다.
+          - grid 좌표는 사용자 설명 기준으로 본다.
+            * 가로축: 이미지 왼쪽 -> 오른쪽으로 증가
+            * 세로축: 이미지 아래 -> 위쪽(12시 방향)으로 증가
+          - 5x5 기준 검사 순서:
+            * 가로: 3 -> 2 -> 4 -> 1 -> 5
+            * 세로: 3 -> 2 -> 4 -> 1 -> 5
+          - 내부 image row는 위쪽이 0이므로, 세로 순서는 사용자 좌표를 image row로 변환해서 사용한다.
+          - 첫 번째 활성화된 grid cell의 중앙 pixel을 X/Y/Z 반환 기준점으로 사용한다.
+        """
         h, w = image_shape[:2]
         n = max(1, int(self.empty_space_grid_divisions))
         cells = self.build_grid_cells(image_shape, n)
@@ -1025,17 +1040,64 @@ class Vision6DPoseManager:
                 "dist_to_image_center": dist_to_image_center,
             })
 
-        # 1순위: cell 수가 가장 많은 빈 영역. 동률이면 화면 중심에 가까운 영역.
-        best_component = sorted(
-            scored_components,
-            key=lambda item: (-item["cell_count"], item["dist_to_image_center"]),
-        )[0]
+        # ------------------------------------------------------------
+        # [666 SELECT POLICY]
+        # 기존: 가장 큰 빈 connected component를 찾고, 그 중심 근처 cell을 선택.
+        # 변경: grid 전체를 중앙에서 가까운 순서로 직접 순회하고,
+        #       disabled가 아닌 첫 번째 cell을 선택.
+        #
+        # 5x5 예시:
+        #   col_order_user/image = 3,2,4,1,5  -> 내부 col 2,1,3,0,4
+        #   row_order_user       = 3,2,4,1,5
+        #   image row 변환       = 2,3,1,4,0  (OpenCV row 0은 이미지 위쪽)
+        # ------------------------------------------------------------
+        center_out_user_order = []
+        center_idx = n // 2
+        for delta in range(n):
+            if delta == 0:
+                candidates = [center_idx]
+            else:
+                candidates = [center_idx - delta, center_idx + delta]
+            for idx in candidates:
+                if 0 <= idx < n and idx not in center_out_user_order:
+                    center_out_user_order.append(idx)
 
-        region_center = best_component["center_xy"]
-        selected_rc = min(
-            best_component["cells_rc"],
-            key=lambda rc: float(np.linalg.norm(np.array(self.grid_cell_center(cells, rc[0], rc[1]), dtype=np.float32) - region_center)),
-        )
+        col_order = list(center_out_user_order)
+        row_order = list(center_out_user_order)
+
+        selected_rc = None
+        selection_order_rc = []
+        for row in row_order:
+            for col in col_order:
+                selection_order_rc.append((row, col))
+                if not disabled_grid[row, col]:
+                    selected_rc = (row, col)
+                    break
+            if selected_rc is not None:
+                break
+
+        if selected_rc is None:
+            return {
+                "success": False,
+                "reason": "no empty grid cells in center-priority order",
+                "cells": cells,
+                "disabled_grid": disabled_grid,
+                "occupancy_ratio_grid": occupancy_ratio_grid,
+                "components": scored_components,
+                "selected_component": [],
+                "selected_cell": None,
+                "selection_order_rc": selection_order_rc,
+            }
+
+        selected_component_cells = []
+        for comp_info in scored_components:
+            comp_set = set(tuple(rc) for rc in comp_info["cells_rc"])
+            if tuple(selected_rc) in comp_set:
+                selected_component_cells = comp_info["cells_rc"]
+                break
+        if not selected_component_cells:
+            selected_component_cells = [selected_rc]
+
         selected_cell = self.get_grid_cell(cells, selected_rc[0], selected_rc[1])
         sx1, sy1, sx2, sy2 = selected_cell["rect"]
         u = int(round((sx1 + sx2 - 1) * 0.5))
@@ -1050,8 +1112,9 @@ class Vision6DPoseManager:
                 "disabled_grid": disabled_grid,
                 "occupancy_ratio_grid": occupancy_ratio_grid,
                 "components": scored_components,
-                "selected_component": best_component["cells_rc"],
+                "selected_component": selected_component_cells,
                 "selected_cell": selected_cell,
+                "selection_order_rc": selection_order_rc,
                 "selected": {"u": u, "v": v, "z": 0.0, "yaw": 0.0, "cell_rc": selected_rc},
             }
 
@@ -1062,8 +1125,9 @@ class Vision6DPoseManager:
             "disabled_grid": disabled_grid,
             "occupancy_ratio_grid": occupancy_ratio_grid,
             "components": scored_components,
-            "selected_component": best_component["cells_rc"],
+            "selected_component": selected_component_cells,
             "selected_cell": selected_cell,
+            "selection_order_rc": selection_order_rc,
             "selected": {"u": u, "v": v, "z": float(z), "yaw": 0.0, "cell_rc": selected_rc},
         }
 
