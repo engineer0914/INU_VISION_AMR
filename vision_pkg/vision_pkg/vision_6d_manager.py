@@ -98,7 +98,7 @@ DEFAULT_EMPTY_SPACE_GRID_DIVISIONS = 5
 DEFAULT_EMPTY_SPACE_VISUALIZE_SEC = 3.0
 # 시각화 시간 초단위
 
-DEFAULT_EMPTY_SPACE_CELL_OCCUPIED_RATIO = 0.000001
+DEFAULT_EMPTY_SPACE_CELL_OCCUPIED_RATIO = 0.0001
 # 활성화 영역내 욜로 마스킹이 비활성화 되는 기준 비율
 # ex) 영역이 100픽셀이라할때, 내부에 욜로 결과가 10픽셀이라면 = 0.1
 
@@ -1067,7 +1067,7 @@ class Vision6DPoseManager:
 
         selected_rc = None
         selection_order_rc = []
-        for row in row_order:
+        for row in row_order[:-1]:
             for col in col_order:
                 selection_order_rc.append((row, col))
                 if not disabled_grid[row, col]:
